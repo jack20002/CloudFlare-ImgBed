@@ -657,7 +657,8 @@ async function uploadSingleChunkToWebDAV(context, chunkData, chunkIndex, totalCh
         }
 
         const chunkFileName = `${originalFileName}.part${chunkIndex.toString().padStart(3, '0')}`;
-        const chunkPath = `chunked/${uploadId}/${chunkFileName}`;
+        // 分块对象平铺存放在渠道根目录：子目录方案下并发分块的 MKCOL 会被 rclone VFS 目录锁以 423 拒绝，导致整文件失败；平铺后 putFile 无需建目录，天然避开锁竞争
+        const chunkPath = `chunked-${uploadId}-${chunkFileName}`;
 
         const webdavAPI = new WebDAVAPI(webdavChannel);
         await webdavAPI.putFile(chunkPath, chunkData);

@@ -52,10 +52,17 @@ export class WebDAVAPI {
         let currentPath = '';
         for (const part of dirParts) {
             currentPath = currentPath ? `${currentPath}/${part}` : part;
-            const response = await davFetch(this.buildObjectUrl(currentPath), {
-                method: 'MKCOL',
-                headers: this.getRequestHeaders(),
-            });
+            let response;
+            // 并发请求时 rclone/VFS 会在目录被占用期间以 423 Locked 拒绝 MKCOL，退避重试而非直接失败
+            for (let attempt = 0; attempt < 6; attempt++) {
+                response = await davFetch(this.buildObjectUrl(currentPath), {
+                    method: 'MKCOL',
+                    headers: this.getRequestHeaders(),
+                });
+                if (response.status !== 423) break;
+                try { await response.body?.cancel(); } catch { /* 忽略释放失败 */ }
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
 
             // 405 commonly means the collection already exists. Some servers return 200/204.
             if (![200, 201, 204, 405].includes(response.status)) {
