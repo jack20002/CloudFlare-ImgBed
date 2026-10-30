@@ -1181,6 +1181,7 @@ async function handleWebDAVChunkedFile(context, imgRecord, encodedFileName, file
     try {
         const webdavAPI = new WebDAVAPI(webdavCredentials);
 
+        // 流式拼接：分块数据边下边发，避免整块（16MB）先缓冲完才出第一个字节导致播放器久等超时
         const stream = new ReadableStream({
             async start(controller) {
                 try {
@@ -1189,31 +1190,52 @@ async function handleWebDAVChunkedFile(context, imgRecord, encodedFileName, file
                     for (let i = 0; i < chunks.length; i++) {
                         const chunk = chunks[i];
                         const chunkSize = chunk.size || 0;
+                        const chunkStartPos = currentPosition;
+                        const chunkEndPos = currentPosition + chunkSize - 1;
+                        currentPosition += chunkSize;
 
-                        if (currentPosition + chunkSize <= rangeStart) {
-                            currentPosition += chunkSize;
+                        if (chunkEndPos < rangeStart) {
                             continue;
                         }
 
-                        if (currentPosition > rangeEnd) {
+                        if (chunkStartPos > rangeEnd) {
                             break;
                         }
 
-                        const chunkData = await fetchWebDAVChunkWithRetry(webdavAPI, chunk, 3);
-                        if (!chunkData) {
+                        // 当前分块与请求范围的交集（分块内偏移）
+                        const sliceStart = Math.max(0, rangeStart - chunkStartPos);
+                        const sliceEnd = Math.min(chunkSize, rangeEnd - chunkStartPos + 1);
+                        let toSkip = sliceStart;
+                        let toSend = sliceEnd - sliceStart;
+
+                        const response = await fetchWebDAVChunkStreamWithRetry(webdavAPI, chunk, 3);
+                        if (!response) {
                             throw new Error(`Failed to fetch chunk ${chunk.index} after retries`);
                         }
 
-                        const chunkStart = Math.max(0, rangeStart - currentPosition);
-                        const chunkEnd = Math.min(chunkSize, rangeEnd - currentPosition + 1);
+                        const reader = response.body.getReader();
+                        try {
+                            while (toSend > 0) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
 
-                        if (chunkStart > 0 || chunkEnd < chunkSize) {
-                            controller.enqueue(chunkData.slice(chunkStart, chunkEnd));
-                        } else {
-                            controller.enqueue(chunkData);
+                                let buf = value;
+                                if (toSkip > 0) {
+                                    const skipped = Math.min(toSkip, buf.length);
+                                    buf = buf.subarray(skipped);
+                                    toSkip -= skipped;
+                                }
+                                if (buf.length > toSend) {
+                                    buf = buf.subarray(0, toSend);
+                                }
+                                if (buf.length > 0) {
+                                    controller.enqueue(buf);
+                                    toSend -= buf.length;
+                                }
+                            }
+                        } finally {
+                            try { await reader.cancel(); } catch { /* 忽略取消失败 */ }
                         }
-
-                        currentPosition += chunkSize;
                     }
 
                     controller.close();
@@ -1244,24 +1266,17 @@ async function handleWebDAVChunkedFile(context, imgRecord, encodedFileName, file
     }
 }
 
-// 带重试机制的WebDAV分片获取函数
-async function fetchWebDAVChunkWithRetry(webdavAPI, chunk, maxRetries = 3) {
+// 带重试机制的WebDAV分片流式获取（仅重试建连阶段，返回可流式读取的 Response）
+async function fetchWebDAVChunkStreamWithRetry(webdavAPI, chunk, maxRetries = 3) {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
             const response = await webdavAPI.getFile(chunk.path);
 
-            if (!response.ok) {
+            if (!response.ok || !response.body) {
                 throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
 
-            const chunkData = await response.arrayBuffer();
-            const actualSize = chunkData.byteLength;
-
-            if (chunk.size && actualSize !== chunk.size) {
-                console.warn(`Chunk ${chunk.index} size mismatch: expected ${chunk.size}, got ${actualSize}`);
-            }
-
-            return new Uint8Array(chunkData);
+            return response;
 
         } catch (error) {
             console.warn(`Chunk ${chunk.index} fetch attempt ${attempt + 1} failed:`, error.message);
