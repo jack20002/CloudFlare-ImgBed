@@ -51,9 +51,6 @@ export async function handleChunkMerge(context) {
 
         // 使用会话中的上传渠道，或者从URL参数获取
         uploadChannel = url.searchParams.get('uploadChannel') || sessionInfo.uploadChannel || 'telegram';
-        if (uploadChannel === 'webdav') {
-            return createResponse('Error: WebDAV channel does not support chunked uploads. Please use non-chunked upload within your Cloudflare request body limit.', { status: 400 });
-        }
 
         // 获取指定的渠道名称（优先URL参数，其次会话信息）
         const channelName = url.searchParams.get('channelName') || sessionInfo.channelName || '';
@@ -230,6 +227,8 @@ async function handleChannelBasedMerge(context, uploadId, totalChunks, originalF
             result = await mergeTelegramChunksInfo(context, uploadId, completedChunks, metadata);
         } else if (uploadChannel === 'discord') {
             result = await mergeDiscordChunksInfo(context, uploadId, completedChunks, metadata);
+        } else if (uploadChannel === 'webdav') {
+            result = await mergeWebDAVChunksInfo(context, uploadId, completedChunks, metadata);
         } else {
             throw new Error(`Unsupported upload channel: ${uploadChannel}`);
         }
@@ -563,5 +562,83 @@ async function mergeDiscordChunksInfo(context, uploadId, completedChunks, metada
 
     } catch (error) {
         throw new Error(`Discord merge failed: ${error.message}`);
+    }
+}
+
+// 合并WebDAV分块信息（二开新增：与 Telegram/Discord 分块一致，分块对象即文件本体，合并仅登记清单，读取时按序拼接）
+async function mergeWebDAVChunksInfo(context, uploadId, completedChunks, metadata) {
+    const { env, waitUntil, uploadConfig, url, specifiedChannelName } = context;
+    const db = getDatabase(env);
+
+    try {
+        const webdavSettings = uploadConfig.webdav;
+        const webdavChannels = webdavSettings?.channels || [];
+
+        // 优先使用指定的渠道名称，其次与分块上传阶段一致的选择策略
+        let webdavChannel;
+        if (specifiedChannelName) {
+            webdavChannel = webdavChannels.find(ch => ch.name === specifiedChannelName);
+        }
+        if (!webdavChannel) {
+            webdavChannel = selectConsistentChannel(webdavChannels, uploadId, webdavSettings?.loadBalance?.enabled);
+        }
+
+        console.log(`Merging WebDAV chunks for uploadId: ${uploadId}, selected channel: ${webdavChannel?.name || 'default'}`);
+
+        if (!webdavChannel) {
+            throw new Error('No WebDAV channel provided');
+        }
+
+        // 按顺序排列分块
+        const sortedChunks = [...completedChunks].sort((a, b) => a.index - b.index);
+
+        // 计算总大小
+        const totalSize = sortedChunks.reduce((sum, chunk) => sum + (chunk.uploadResult.size || 0), 0);
+
+        // 构建分块信息数组（path 为分块对象在 WebDAV 中的路径）
+        const chunks = sortedChunks.map(chunk => ({
+            index: chunk.index,
+            path: chunk.uploadResult.path,
+            size: chunk.uploadResult.size,
+            fileName: chunk.uploadResult.fileName
+        }));
+
+        // 生成 finalFileId
+        const finalFileId = await buildUniqueFileId(context, metadata.FileName, metadata.FileType);
+
+        // 更新metadata
+        metadata.Channel = "WebDAV";
+        metadata.ChannelName = webdavChannel.name;
+        metadata.WebDAVFilePath = chunks[0]?.path || '';
+        metadata.IsChunked = true;
+        metadata.TotalChunks = completedChunks.length;
+        metadata.FileSize = (totalSize / 1024 / 1024).toFixed(2);
+        metadata.FileSizeBytes = totalSize;
+
+        // 将分片信息存储到value中
+        const chunksData = JSON.stringify(chunks);
+
+        // 写入数据库
+        await db.put(finalFileId, chunksData, { metadata });
+
+        // 异步结束上传
+        waitUntil(endUpload(context, finalFileId, metadata));
+
+        // 生成返回链接
+        const returnFormat = url.searchParams.get('returnFormat') || 'default';
+        let updatedReturnLink = '';
+        if (returnFormat === 'full') {
+            updatedReturnLink = `${url.origin}/file/${finalFileId}`;
+        } else {
+            updatedReturnLink = `/file/${finalFileId}`;
+        }
+
+        return {
+            success: true,
+            result: [{ 'src': updatedReturnLink }]
+        };
+
+    } catch (error) {
+        throw new Error(`WebDAV merge failed: ${error.message}`);
     }
 }

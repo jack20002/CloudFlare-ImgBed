@@ -3,6 +3,7 @@ import { createS3Client } from '../utils/storage/s3Client.js';
 import { createResponse, selectConsistentChannel, getUploadIp, getIPAddress, buildUniqueFileId, endUpload } from './uploadTools';
 import { TelegramAPI } from '../utils/storage/telegramAPI';
 import { DiscordAPI } from '../utils/storage/discordAPI';
+import { WebDAVAPI } from '../utils/storage/webdavAPI.js';
 import { CreateMultipartUploadCommand, UploadPartCommand, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { getDatabase, checkDatabaseConfig } from '../utils/databaseAdapter.js';
 import { fetchPageConfig } from '../utils/sysConfig.js';
@@ -36,9 +37,6 @@ export async function initializeChunkedUpload(context) {
 
         // 获取上传渠道
         const uploadChannel = url.searchParams.get('uploadChannel') || 'telegram';
-        if (uploadChannel === 'webdav') {
-            return createResponse('Error: WebDAV channel does not support chunked uploads. Please use non-chunked upload within your Cloudflare request body limit.', { status: 400 });
-        }
         // 获取指定的渠道名称
         const channelName = url.searchParams.get('channelName') || '';
 
@@ -127,9 +125,6 @@ export async function handleChunkUpload(context) {
 
         // 获取上传渠道
         const uploadChannel = url.searchParams.get('uploadChannel') || sessionInfo.uploadChannel || 'telegram';
-        if (uploadChannel === 'webdav') {
-            return createResponse('Error: WebDAV channel does not support chunked uploads. Please use non-chunked upload within your Cloudflare request body limit.', { status: 400 });
-        }
         // 获取指定的渠道名称
         const channelName = url.searchParams.get('channelName') || sessionInfo.channelName || '';
 
@@ -298,6 +293,8 @@ async function uploadChunkToStorage(context, chunkIndex, totalChunks, uploadId, 
                 uploadResult = await uploadSingleChunkToTelegram(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType);
             } else if (uploadChannel === 'discord') {
                 uploadResult = await uploadSingleChunkToDiscord(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType);
+            } else if (uploadChannel === 'webdav') {
+                uploadResult = await uploadSingleChunkToWebDAV(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType);
             }
 
             if (uploadResult && uploadResult.success) {
@@ -636,6 +633,52 @@ async function uploadSingleChunkToTelegram(context, chunkData, chunkIndex, total
     }
 }
 
+// 上传单个分块到WebDAV（二开新增：分块以独立对象暂存于 chunked/<uploadId>/ 目录，合并阶段仅登记分块清单，读取时按序拼接）
+async function uploadSingleChunkToWebDAV(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType) {
+    const { uploadConfig, specifiedChannelName } = context;
+
+    try {
+        const webdavSettings = uploadConfig.webdav;
+        const webdavChannels = webdavSettings?.channels || [];
+
+        // 优先使用指定的渠道名称，其次按 uploadId 一致性选择，保证同一文件的所有分块落在同一渠道
+        let webdavChannel;
+        if (specifiedChannelName) {
+            webdavChannel = webdavChannels.find(ch => ch.name === specifiedChannelName);
+        }
+        if (!webdavChannel) {
+            webdavChannel = selectConsistentChannel(webdavChannels, uploadId, webdavSettings?.loadBalance?.enabled);
+        }
+
+        console.log(`Uploading WebDAV chunk ${chunkIndex} for uploadId: ${uploadId}, selected channel: ${webdavChannel?.name || 'default'}`);
+
+        if (!webdavChannel || !webdavChannel.baseUrl) {
+            return { success: false, error: 'No WebDAV channel provided' };
+        }
+
+        const chunkFileName = `${originalFileName}.part${chunkIndex.toString().padStart(3, '0')}`;
+        const chunkPath = `chunked/${uploadId}/${chunkFileName}`;
+
+        const webdavAPI = new WebDAVAPI(webdavChannel);
+        await webdavAPI.putFile(chunkPath, chunkData);
+
+        return {
+            success: true,
+            path: chunkPath,
+            size: chunkData.byteLength,
+            fileName: chunkFileName,
+            uploadTime: Date.now(),
+            webdavChannel: webdavChannel.name
+        };
+
+    } catch (error) {
+        return {
+            success: false,
+            error: error.message
+        };
+    }
+}
+
 // 上传单个分块到Discord
 async function uploadSingleChunkToDiscord(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType) {
     const { uploadConfig, specifiedChannelName } = context;
@@ -885,6 +928,8 @@ async function retrySingleChunk(context, chunk, uploadChannel, maxRetries = 5, r
                     return await uploadSingleChunkToTelegram(context, chunkData, chunk.index, totalChunks, uploadId, originalFileName, originalFileType);
                 } else if (uploadChannel === 'discord') {
                     return await uploadSingleChunkToDiscord(context, chunkData, chunk.index, totalChunks, uploadId, originalFileName, originalFileType);
+                } else if (uploadChannel === 'webdav') {
+                    return await uploadSingleChunkToWebDAV(context, chunkData, chunk.index, totalChunks, uploadId, originalFileName, originalFileType);
                 }
                 return null;
             })();

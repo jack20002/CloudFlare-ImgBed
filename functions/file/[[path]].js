@@ -139,6 +139,11 @@ export async function onRequest(context) {  // Contents of context object
 
     /* WebDAV 渠道 */
     if (imgRecord.metadata?.Channel === 'WebDAV') {
+        // 检查是否为分片文件（二开新增）
+        if (imgRecord.metadata?.IsChunked === true) {
+            const response = await handleWebDAVChunkedFile(context, imgRecord, encodedFileName, fileType);
+            return await transformImageResponse(context, response);
+        }
         const response = await handleWebDAVFile(context, imgRecord.metadata, encodedFileName, fileType);
         return await transformImageResponse(context, response);
     }
@@ -1095,6 +1100,181 @@ async function handleWebDAVFile(context, metadata, encodedFileName, fileType) {
     } catch (error) {
         return new Response(`Error: Failed to fetch from WebDAV - ${error.message}`, { status: 500 });
     }
+}
+
+// 处理 WebDAV 渠道分片文件读取（二开新增：结构与 Telegram 分片读取一致，分块数据经 WebDAV 按序取回拼接）
+async function handleWebDAVChunkedFile(context, imgRecord, encodedFileName, fileType) {
+    const { env, request } = context;
+
+    const metadata = imgRecord.metadata;
+    const db = getDatabase(env);
+    const webdavCredentials = await resolveWebDAVCredentials(db, env, metadata);
+
+    if (!webdavCredentials.baseUrl) {
+        return new Response('Error: WebDAV channel config not found', { status: 500 });
+    }
+
+    // 从记录的value中读取分片信息
+    let chunks = [];
+    try {
+        if (imgRecord.value) {
+            chunks = JSON.parse(imgRecord.value);
+            chunks.sort((a, b) => a.index - b.index);
+        }
+    } catch (parseError) {
+        console.error('Failed to parse chunks data:', parseError);
+        return new Response('Error: Invalid chunks data', { status: 500 });
+    }
+
+    if (chunks.length === 0) {
+        return new Response('Error: No chunks found for this file', { status: 500 });
+    }
+
+    const expectedChunks = metadata.TotalChunks || chunks.length;
+    if (chunks.length !== expectedChunks) {
+        return new Response(`Error: Missing chunks, expected ${expectedChunks}, got ${chunks.length}`, { status: 500 });
+    }
+
+    const totalSize = chunks.reduce((total, chunk) => total + (chunk.size || 0), 0);
+
+    const headers = new Headers();
+    setCommonHeaders(headers, encodedFileName, fileType, getChunkedFileCacheControl(context));
+    headers.set('Content-Length', totalSize.toString());
+
+    const etag = `"${metadata.TimeStamp || Date.now()}-${totalSize}"`;
+    headers.set('ETag', etag);
+
+    const ifNoneMatch = request.headers.get('If-None-Match');
+    if (ifNoneMatch && ifNoneMatch === etag) {
+        return new Response(null, {
+            status: 304,
+            headers: {
+                'ETag': etag,
+                'Cache-Control': headers.get('Cache-Control'),
+                'Accept-Ranges': 'bytes'
+            }
+        });
+    }
+
+    const range = request.headers.get('Range');
+    let rangeStart = 0;
+    let rangeEnd = totalSize - 1;
+    let isRangeRequest = false;
+
+    if (range) {
+        const matches = range.match(/bytes=(\d+)-(\d*)/);
+        if (matches) {
+            rangeStart = parseInt(matches[1]);
+            rangeEnd = matches[2] ? parseInt(matches[2]) : totalSize - 1;
+            isRangeRequest = true;
+
+            if (rangeStart >= totalSize || rangeEnd >= totalSize || rangeStart > rangeEnd) {
+                return new Response('Range Not Satisfiable', { status: 416 });
+            }
+        }
+    }
+
+    if (request.method === 'HEAD') {
+        return handleHeadRequest(headers, etag);
+    }
+
+    try {
+        const webdavAPI = new WebDAVAPI(webdavCredentials);
+
+        const stream = new ReadableStream({
+            async start(controller) {
+                try {
+                    let currentPosition = 0;
+
+                    for (let i = 0; i < chunks.length; i++) {
+                        const chunk = chunks[i];
+                        const chunkSize = chunk.size || 0;
+
+                        if (currentPosition + chunkSize <= rangeStart) {
+                            currentPosition += chunkSize;
+                            continue;
+                        }
+
+                        if (currentPosition > rangeEnd) {
+                            break;
+                        }
+
+                        const chunkData = await fetchWebDAVChunkWithRetry(webdavAPI, chunk, 3);
+                        if (!chunkData) {
+                            throw new Error(`Failed to fetch chunk ${chunk.index} after retries`);
+                        }
+
+                        const chunkStart = Math.max(0, rangeStart - currentPosition);
+                        const chunkEnd = Math.min(chunkSize, rangeEnd - currentPosition + 1);
+
+                        if (chunkStart > 0 || chunkEnd < chunkSize) {
+                            controller.enqueue(chunkData.slice(chunkStart, chunkEnd));
+                        } else {
+                            controller.enqueue(chunkData);
+                        }
+
+                        currentPosition += chunkSize;
+                    }
+
+                    controller.close();
+                } catch (error) {
+                    controller.error(error);
+                }
+            }
+        });
+
+        if (isRangeRequest) {
+            setRangeHeaders(headers, rangeStart, rangeEnd, totalSize);
+
+            return new Response(stream, {
+                status: 206,
+                headers,
+            });
+        } else {
+            headers.set('Cache-Control', getChunkedFileCacheControl(context));
+
+            return new Response(stream, {
+                status: 200,
+                headers,
+            });
+        }
+
+    } catch (error) {
+        return new Response(`Error: Failed to reconstruct chunked file - ${error.message}`, { status: 500 });
+    }
+}
+
+// 带重试机制的WebDAV分片获取函数
+async function fetchWebDAVChunkWithRetry(webdavAPI, chunk, maxRetries = 3) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const response = await webdavAPI.getFile(chunk.path);
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const chunkData = await response.arrayBuffer();
+            const actualSize = chunkData.byteLength;
+
+            if (chunk.size && actualSize !== chunk.size) {
+                console.warn(`Chunk ${chunk.index} size mismatch: expected ${chunk.size}, got ${actualSize}`);
+            }
+
+            return new Uint8Array(chunkData);
+
+        } catch (error) {
+            console.warn(`Chunk ${chunk.index} fetch attempt ${attempt + 1} failed:`, error.message);
+
+            if (attempt === maxRetries - 1) {
+                return null;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+        }
+    }
+
+    return null;
 }
 
 function getWebDAVPublicFileUrl(webdavCredentials, filePath) {

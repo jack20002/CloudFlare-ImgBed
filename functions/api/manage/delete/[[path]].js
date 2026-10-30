@@ -276,13 +276,6 @@ async function deleteHuggingFaceFile(env, img) {
 
 // 删除 WebDAV 渠道的图片
 async function deleteWebDAVFile(env, img) {
-    const filePath = img.metadata?.WebDAVFilePath;
-
-    if (!filePath) {
-        console.warn('WebDAV file missing required metadata for deletion');
-        return false;
-    }
-
     try {
         const db = getDatabase(env);
         const webdavCredentials = await resolveWebDAVCredentials(db, env, img.metadata);
@@ -292,6 +285,39 @@ async function deleteWebDAVFile(env, img) {
         }
 
         const webdavAPI = new WebDAVAPI(webdavCredentials);
+
+        // 分片文件（二开新增）：逐个删除 value 中登记的分块对象
+        if (img.metadata?.IsChunked) {
+            let chunks = [];
+            try {
+                chunks = JSON.parse(img.value || '[]');
+            } catch {
+                chunks = [];
+            }
+
+            if (chunks.length === 0) {
+                console.warn('WebDAV chunked file has no chunk records for deletion');
+                return false;
+            }
+
+            let allDeleted = true;
+            for (const chunk of chunks) {
+                if (!chunk.path) continue;
+                const ok = await webdavAPI.deleteFile(chunk.path).catch(err => {
+                    console.error('WebDAV chunk delete failed:', chunk.path, err.message);
+                    return false;
+                });
+                if (!ok) allDeleted = false;
+            }
+            return allDeleted;
+        }
+
+        const filePath = img.metadata?.WebDAVFilePath;
+        if (!filePath) {
+            console.warn('WebDAV file missing required metadata for deletion');
+            return false;
+        }
+
         return await webdavAPI.deleteFile(filePath);
     } catch (error) {
         console.error("WebDAV Delete Failed:", error);
