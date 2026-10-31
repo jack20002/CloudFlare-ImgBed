@@ -1,6 +1,6 @@
 import { createS3Client } from '../utils/storage/s3Client.js';
 /* ======= 客户端分块上传处理 ======= */
-import { createResponse, selectConsistentChannel, getUploadIp, getIPAddress, buildUniqueFileId, endUpload } from './uploadTools';
+import { createResponse, checkUploadFormat, selectConsistentChannel, getUploadIp, getIPAddress, buildUniqueFileId, endUpload } from './uploadTools';
 import { TelegramAPI } from '../utils/storage/telegramAPI';
 import { DiscordAPI } from '../utils/storage/discordAPI';
 import { WebDAVAPI } from '../utils/storage/webdavAPI.js';
@@ -25,6 +25,9 @@ export async function initializeChunkedUpload(context) {
         if (!originalFileName || !originalFileType || !totalChunks) {
             return createResponse('Error: Missing initialization parameters', { status: 400 });
         }
+
+        const formatError = checkUploadFormat(originalFileName, context.uploadConfig);
+        if (formatError) return formatError;
 
         // 生成唯一的 uploadId
         const timestamp = Date.now();
@@ -117,6 +120,9 @@ export async function handleChunkUpload(context) {
             sessionInfo.totalChunks !== totalChunks) {
             return createResponse('Error: Session parameters mismatch', { status: 400 });
         }
+
+        const formatError = checkUploadFormat(sessionInfo.originalFileName, context.uploadConfig);
+        if (formatError) return formatError;
 
         // 检查会话是否过期
         if (Date.now() > sessionInfo.expiresAt) {
@@ -633,7 +639,7 @@ async function uploadSingleChunkToTelegram(context, chunkData, chunkIndex, total
     }
 }
 
-// 上传单个分块到WebDAV（二开新增：分块以独立对象暂存于 chunked/<uploadId>/ 目录，合并阶段仅登记分块清单，读取时按序拼接）
+// 上传单个分块到WebDAV（二开新增：分块以独立对象平铺暂存于渠道根目录（chunked-<uploadId>-<原名>.partNNN），合并阶段仅登记分块清单，读取时按序拼接）
 async function uploadSingleChunkToWebDAV(context, chunkData, chunkIndex, totalChunks, uploadId, originalFileName, originalFileType) {
     const { uploadConfig, specifiedChannelName } = context;
 
@@ -1319,6 +1325,9 @@ export async function uploadLargeFileToTelegram(context, file, fullId, metadata,
         const responseBody = [{ 'src': returnLink }];
         if (urlPrefix) {
             responseBody[0].publicUrl = `${urlPrefix.replace(/\/+$/, '')}/${fullId}`;
+        }
+        if (metadata.ExpiresAt) {
+            responseBody[0].expiresAt = metadata.ExpiresAt;
         }
 
         return createResponse(
